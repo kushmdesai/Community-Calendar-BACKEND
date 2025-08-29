@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
 from typing import List, Optional
@@ -14,8 +14,8 @@ from enum import Enum
 # Initialize FastAPI app
 app = FastAPI(
     title="Community Calendar API",
-    description="A REST API for managing community events",
-    version="1.0.0"
+    description="A REST API for managing community events with RSVP and location features",
+    version="2.0.0"
 )
 
 # Enable CORS for frontend integration
@@ -31,10 +31,11 @@ app.add_middleware(
 DATABASE_URL = "calendar.db"
 
 def init_db():
-    """Initialize the database with events table"""
+    """Initialize the database with events and rsvps tables"""
     conn = sqlite3.connect(DATABASE_URL)
     cursor = conn.cursor()
     
+    # Events table with location support
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,37 +49,52 @@ def init_db():
             recurrence_interval INTEGER DEFAULT 1,
             recurrence_end_date DATE,
             parent_event_id INTEGER,
+            location_type TEXT DEFAULT 'in_person',
+            location_name TEXT,
+            location_address TEXT,
+            online_meeting_url TEXT,
+            max_attendees INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (parent_event_id) REFERENCES events (id)
         )
     """)
     
-    # Add columns if they don't exist (for existing databases)
-    try:
-        cursor.execute("ALTER TABLE events ADD COLUMN is_recurring BOOLEAN DEFAULT FALSE")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE events ADD COLUMN recurrence_type TEXT")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE events ADD COLUMN recurrence_interval INTEGER DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE events ADD COLUMN recurrence_end_date DATE")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE events ADD COLUMN parent_event_id INTEGER")
-    except sqlite3.OperationalError:
-        pass
+    # RSVPs table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS rsvps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            attendee_name TEXT NOT NULL,
+            attendee_email TEXT,
+            status TEXT NOT NULL DEFAULT 'going',
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (event_id) REFERENCES events (id) ON DELETE CASCADE,
+            UNIQUE(event_id, attendee_email)
+        )
+    """)
+    
+    # Add new columns to existing events table if they don't exist
+    columns_to_add = [
+        ("location_type", "TEXT DEFAULT 'in_person'"),
+        ("location_name", "TEXT"),
+        ("location_address", "TEXT"),
+        ("online_meeting_url", "TEXT"),
+        ("max_attendees", "INTEGER"),
+        ("is_recurring", "BOOLEAN DEFAULT FALSE"),
+        ("recurrence_type", "TEXT"),
+        ("recurrence_interval", "INTEGER DEFAULT 1"),
+        ("recurrence_end_date", "DATE"),
+        ("parent_event_id", "INTEGER")
+    ]
+    
+    for column_name, column_def in columns_to_add:
+        try:
+            cursor.execute(f"ALTER TABLE events ADD COLUMN {column_name} {column_def}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     conn.commit()
     conn.close()
@@ -99,6 +115,16 @@ class RecurrenceType(str, Enum):
     MONTHLY = "monthly"
     YEARLY = "yearly"
 
+class LocationType(str, Enum):
+    IN_PERSON = "in_person"
+    ONLINE = "online"
+    HYBRID = "hybrid"
+
+class RSVPStatus(str, Enum):
+    GOING = "going"
+    NOT_GOING = "not_going"
+    MAYBE = "maybe"
+
 # Pydantic models for request/response validation
 class EventCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=200, description="Event title")
@@ -110,6 +136,11 @@ class EventCreate(BaseModel):
     recurrence_type: Optional[RecurrenceType] = Field(None, description="Type of recurrence")
     recurrence_interval: Optional[int] = Field(1, ge=1, le=365, description="Recurrence interval")
     recurrence_end_date: Optional[date] = Field(None, description="When to stop recurrence")
+    location_type: LocationType = Field(LocationType.IN_PERSON, description="Type of event location")
+    location_name: Optional[str] = Field(None, max_length=200, description="Name of the location")
+    location_address: Optional[str] = Field(None, max_length=500, description="Address for in-person events")
+    online_meeting_url: Optional[str] = Field(None, max_length=500, description="URL for online meetings")
+    max_attendees: Optional[int] = Field(None, ge=1, description="Maximum number of attendees")
 
     model_config = {
         "json_schema_extra": {
@@ -118,7 +149,11 @@ class EventCreate(BaseModel):
                 "description": "Join us for a fun community barbecue in the park!",
                 "event_date": "2024-07-15",
                 "event_time": "18:00",
-                "organizer": "Community Center"
+                "organizer": "Community Center",
+                "location_type": "in_person",
+                "location_name": "Central Park",
+                "location_address": "123 Park Avenue, City, State",
+                "max_attendees": 50
             }
         }
     }
@@ -133,6 +168,44 @@ class EventUpdate(BaseModel):
     recurrence_type: Optional[RecurrenceType] = None
     recurrence_interval: Optional[int] = Field(None, ge=1, le=365)
     recurrence_end_date: Optional[date] = None
+    location_type: Optional[LocationType] = None
+    location_name: Optional[str] = Field(None, max_length=200)
+    location_address: Optional[str] = Field(None, max_length=500)
+    online_meeting_url: Optional[str] = Field(None, max_length=500)
+    max_attendees: Optional[int] = Field(None, ge=1)
+
+class RSVPCreate(BaseModel):
+    attendee_name: str = Field(..., min_length=1, max_length=100, description="Name of the attendee")
+    attendee_email: Optional[str] = Field(None, max_length=255, description="Email of the attendee")
+    status: RSVPStatus = Field(RSVPStatus.GOING, description="RSVP status")
+    notes: Optional[str] = Field(None, max_length=500, description="Additional notes")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "attendee_name": "John Doe",
+                "attendee_email": "john@example.com",
+                "status": "going",
+                "notes": "Looking forward to it!"
+            }
+        }
+    }
+
+class RSVPUpdate(BaseModel):
+    status: Optional[RSVPStatus] = None
+    notes: Optional[str] = Field(None, max_length=500)
+
+class RSVPResponse(BaseModel):
+    id: int
+    event_id: int
+    attendee_name: str
+    attendee_email: Optional[str]
+    status: str
+    notes: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
 
 class EventResponse(BaseModel):
     id: int
@@ -146,10 +219,22 @@ class EventResponse(BaseModel):
     recurrence_interval: Optional[int]
     recurrence_end_date: Optional[date]
     parent_event_id: Optional[int]
+    location_type: Optional[str]
+    location_name: Optional[str]
+    location_address: Optional[str]
+    online_meeting_url: Optional[str]
+    max_attendees: Optional[int]
+    rsvp_count: Optional[int] = 0
+    going_count: Optional[int] = 0
+    maybe_count: Optional[int] = 0
+    not_going_count: Optional[int] = 0
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+class EventWithRSVPs(EventResponse):
+    rsvps: List[RSVPResponse] = []
 
 def generate_recurring_events(base_event: dict) -> List[dict]:
     """Generate recurring events based on the base event"""
@@ -187,6 +272,29 @@ def generate_recurring_events(base_event: dict) -> List[dict]:
 
     return events
 
+def get_rsvp_counts(conn, event_id: int) -> dict:
+    """Get RSVP counts for an event"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT status, COUNT(*) as count 
+        FROM rsvps 
+        WHERE event_id = ? 
+        GROUP BY status
+    """, (event_id,))
+    
+    counts = {"going": 0, "maybe": 0, "not_going": 0}
+    for row in cursor.fetchall():
+        counts[row["status"]] = row["count"]
+    
+    return counts
+
+def safe_get(row, column, default=None):
+    """Helper function to safely get column values"""
+    try:
+        return row[column] if row[column] is not None else default
+    except (KeyError, IndexError):
+        return default
+
 # API Routes
 
 @app.on_event("startup")
@@ -197,7 +305,7 @@ async def startup_event():
 @app.get("/", tags=["Root"])
 async def root():
     """Welcome message"""
-    return {"message": "Community Calendar API", "version": "1.0.0"}
+    return {"message": "Community Calendar API with RSVP & Location Support", "version": "2.0.0"}
 
 @app.get("/health", tags=["Health"])
 async def health_check():
@@ -207,20 +315,23 @@ async def health_check():
 @app.post("/api/events", response_model=EventResponse, tags=["Events"])
 async def create_event(event: EventCreate):
     """Create a new event"""
-    print(f"Creating event with data: {event}")
     try:
         with get_db() as conn:
             cursor = conn.cursor()
-            print(f"Inserting: title={event.title}, date={event.event_date}, time={event.event_time}")
             cursor.execute("""
-                INSERT INTO events (title, description, date, time, organizer, is_recurring, recurrence_type, recurrence_interval, recurrence_end_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (event.title, event.description, event.event_date, event.event_time, event.organizer,
-                  event.is_recurring, event.recurrence_type, event.recurrence_interval, event.recurrence_end_date))
+                INSERT INTO events (title, description, date, time, organizer, is_recurring, 
+                                  recurrence_type, recurrence_interval, recurrence_end_date,
+                                  location_type, location_name, location_address, 
+                                  online_meeting_url, max_attendees)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (event.title, event.description, event.event_date, event.event_time, 
+                  event.organizer, event.is_recurring, event.recurrence_type, 
+                  event.recurrence_interval, event.recurrence_end_date,
+                  event.location_type, event.location_name, event.location_address,
+                  event.online_meeting_url, event.max_attendees))
             
             event_id = cursor.lastrowid
             conn.commit()
-            print(f"Event created with ID: {event_id}")
             
             # Generate recurring events if needed
             if event.is_recurring:
@@ -234,31 +345,37 @@ async def create_event(event: EventCreate):
                     'is_recurring': event.is_recurring,
                     'recurrence_type': event.recurrence_type,
                     'recurrence_interval': event.recurrence_interval,
-                    'recurrence_end_date': event.recurrence_end_date
+                    'recurrence_end_date': event.recurrence_end_date,
+                    'location_type': event.location_type,
+                    'location_name': event.location_name,
+                    'location_address': event.location_address,
+                    'online_meeting_url': event.online_meeting_url,
+                    'max_attendees': event.max_attendees
                 }
 
                 recurring_events = generate_recurring_events(base_event_dict)
 
                 for rec_event in recurring_events:
                     cursor.execute("""
-                        INSERT INTO events (title, description, date, time, organizer, is_recurring, recurrence_type, recurrence_interval, recurrence_end_date, parent_event_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO events (title, description, date, time, organizer, is_recurring, 
+                                          recurrence_type, recurrence_interval, recurrence_end_date, 
+                                          parent_event_id, location_type, location_name, location_address,
+                                          online_meeting_url, max_attendees)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (rec_event['title'], rec_event['description'], rec_event['event_date'],
-                          rec_event['event_time'], rec_event['organizer'], False, None, None, None, rec_event['parent_event_id']))
+                          rec_event['event_time'], rec_event['organizer'], False, None, None, 
+                          None, rec_event['parent_event_id'], rec_event['location_type'],
+                          rec_event['location_name'], rec_event['location_address'],
+                          rec_event['online_meeting_url'], rec_event['max_attendees']))
                     
                 conn.commit()
 
-            # Fetch the created event
+            # Fetch the created event with RSVP counts
             cursor.execute("SELECT * FROM events WHERE id = ?", (event_id,))
             row = cursor.fetchone()
             
             if row:
-                # Helper function to safely get column values
-                def safe_get(row, column, default=None):
-                    try:
-                        return row[column] if row[column] is not None else default
-                    except (KeyError, IndexError):
-                        return default
+                rsvp_counts = get_rsvp_counts(conn, event_id)
                 
                 return EventResponse(
                     id=row["id"],
@@ -272,6 +389,15 @@ async def create_event(event: EventCreate):
                     recurrence_interval=safe_get(row, 'recurrence_interval'),
                     recurrence_end_date=safe_get(row, 'recurrence_end_date'),
                     parent_event_id=safe_get(row, 'parent_event_id'),
+                    location_type=safe_get(row, 'location_type', 'in_person'),
+                    location_name=safe_get(row, 'location_name'),
+                    location_address=safe_get(row, 'location_address'),
+                    online_meeting_url=safe_get(row, 'online_meeting_url'),
+                    max_attendees=safe_get(row, 'max_attendees'),
+                    rsvp_count=sum(rsvp_counts.values()),
+                    going_count=rsvp_counts["going"],
+                    maybe_count=rsvp_counts["maybe"],
+                    not_going_count=rsvp_counts["not_going"],
                     created_at=datetime.fromisoformat(row["created_at"]),
                     updated_at=datetime.fromisoformat(row["updated_at"])
                 )
@@ -284,7 +410,8 @@ async def create_event(event: EventCreate):
 async def get_all_events(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    organizer: Optional[str] = None
+    organizer: Optional[str] = None,
+    location_type: Optional[LocationType] = None
 ):
     """Get all events with optional filtering"""
     try:
@@ -305,21 +432,20 @@ async def get_all_events(
             if organizer:
                 query += " AND organizer LIKE ?"
                 params.append(f"%{organizer}%")
+
+            if location_type:
+                query += " AND location_type = ?"
+                params.append(location_type)
             
             query += " ORDER BY date ASC, time ASC"
             
             cursor.execute(query, params)
             rows = cursor.fetchall()
             
-            # Helper function to safely get column values
-            def safe_get(row, column, default=None):
-                try:
-                    return row[column] if row[column] is not None else default
-                except (KeyError, IndexError):
-                    return default
-            
             events = []
             for row in rows:
+                rsvp_counts = get_rsvp_counts(conn, row["id"])
+                
                 events.append(EventResponse(
                     id=row["id"],
                     title=row["title"],
@@ -332,6 +458,15 @@ async def get_all_events(
                     recurrence_interval=safe_get(row, 'recurrence_interval'),
                     recurrence_end_date=safe_get(row, 'recurrence_end_date'),
                     parent_event_id=safe_get(row, 'parent_event_id'),
+                    location_type=safe_get(row, 'location_type', 'in_person'),
+                    location_name=safe_get(row, 'location_name'),
+                    location_address=safe_get(row, 'location_address'),
+                    online_meeting_url=safe_get(row, 'online_meeting_url'),
+                    max_attendees=safe_get(row, 'max_attendees'),
+                    rsvp_count=sum(rsvp_counts.values()),
+                    going_count=rsvp_counts["going"],
+                    maybe_count=rsvp_counts["maybe"],
+                    not_going_count=rsvp_counts["not_going"],
                     created_at=datetime.fromisoformat(row["created_at"]),
                     updated_at=datetime.fromisoformat(row["updated_at"])
                 ))
@@ -342,9 +477,9 @@ async def get_all_events(
         print(f"Error fetching events: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch events: {str(e)}")
 
-@app.get("/api/events/{event_id}", response_model=EventResponse, tags=["Events"])
-async def get_event(event_id: int):
-    """Get a specific event by ID"""
+@app.get("/api/events/{event_id}", response_model=EventWithRSVPs, tags=["Events"])
+async def get_event(event_id: int, include_rsvps: bool = False):
+    """Get a specific event by ID with optional RSVPs"""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
@@ -354,14 +489,26 @@ async def get_event(event_id: int):
             if not row:
                 raise HTTPException(status_code=404, detail="Event not found")
             
-            # Helper function to safely get column values
-            def safe_get(row, column, default=None):
-                try:
-                    return row[column] if row[column] is not None else default
-                except (KeyError, IndexError):
-                    return default
+            rsvp_counts = get_rsvp_counts(conn, event_id)
+            rsvps = []
             
-            return EventResponse(
+            if include_rsvps:
+                cursor.execute("SELECT * FROM rsvps WHERE event_id = ? ORDER BY created_at", (event_id,))
+                rsvp_rows = cursor.fetchall()
+                
+                for rsvp_row in rsvp_rows:
+                    rsvps.append(RSVPResponse(
+                        id=rsvp_row["id"],
+                        event_id=rsvp_row["event_id"],
+                        attendee_name=rsvp_row["attendee_name"],
+                        attendee_email=rsvp_row["attendee_email"],
+                        status=rsvp_row["status"],
+                        notes=rsvp_row["notes"],
+                        created_at=datetime.fromisoformat(rsvp_row["created_at"]),
+                        updated_at=datetime.fromisoformat(rsvp_row["updated_at"])
+                    ))
+            
+            return EventWithRSVPs(
                 id=row["id"],
                 title=row["title"],
                 description=row["description"],
@@ -373,8 +520,18 @@ async def get_event(event_id: int):
                 recurrence_interval=safe_get(row, 'recurrence_interval'),
                 recurrence_end_date=safe_get(row, 'recurrence_end_date'),
                 parent_event_id=safe_get(row, 'parent_event_id'),
+                location_type=safe_get(row, 'location_type', 'in_person'),
+                location_name=safe_get(row, 'location_name'),
+                location_address=safe_get(row, 'location_address'),
+                online_meeting_url=safe_get(row, 'online_meeting_url'),
+                max_attendees=safe_get(row, 'max_attendees'),
+                rsvp_count=sum(rsvp_counts.values()),
+                going_count=rsvp_counts["going"],
+                maybe_count=rsvp_counts["maybe"],
+                not_going_count=rsvp_counts["not_going"],
                 created_at=datetime.fromisoformat(row["created_at"]),
-                updated_at=datetime.fromisoformat(row["updated_at"])
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+                rsvps=rsvps
             )
     
     except HTTPException:
@@ -382,7 +539,6 @@ async def get_event(event_id: int):
     except Exception as e:
         print(f"Error fetching event: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch event: {str(e)}")
-
 
 @app.put("/api/events/{event_id}", response_model=EventResponse, tags=["Events"])
 async def update_event(event_id: int, event: EventUpdate):
@@ -400,41 +556,27 @@ async def update_event(event_id: int, event: EventUpdate):
             update_fields = []
             params = []
             
-            if event.title is not None:
-                update_fields.append("title = ?")
-                params.append(event.title)
+            field_mappings = {
+                'title': event.title,
+                'description': event.description,
+                'date': event.event_date,
+                'time': event.event_time,
+                'organizer': event.organizer,
+                'is_recurring': event.is_recurring,
+                'recurrence_type': event.recurrence_type,
+                'recurrence_interval': event.recurrence_interval,
+                'recurrence_end_date': event.recurrence_end_date,
+                'location_type': event.location_type,
+                'location_name': event.location_name,
+                'location_address': event.location_address,
+                'online_meeting_url': event.online_meeting_url,
+                'max_attendees': event.max_attendees
+            }
             
-            if event.description is not None:
-                update_fields.append("description = ?")
-                params.append(event.description)
-            
-            if event.event_date is not None:
-                update_fields.append("date = ?")
-                params.append(event.event_date)
-            
-            if event.event_time is not None:
-                update_fields.append("time = ?")
-                params.append(event.event_time)
-            
-            if event.organizer is not None:
-                update_fields.append("organizer = ?")
-                params.append(event.organizer)
-
-            if event.is_recurring is not None:
-                update_fields.append("is_recurring = ?")
-                params.append(event.is_recurring)
-
-            if event.recurrence_type is not None:
-                update_fields.append("recurrence_type = ?")
-                params.append(event.recurrence_type)
-
-            if event.recurrence_interval is not None:
-                update_fields.append("recurrence_interval = ?")
-                params.append(event.recurrence_interval)
-
-            if event.recurrence_end_date is not None:
-                update_fields.append("recurrence_end_date = ?")
-                params.append(event.recurrence_end_date)
+            for db_field, value in field_mappings.items():
+                if value is not None:
+                    update_fields.append(f"{db_field} = ?")
+                    params.append(value)
             
             if not update_fields:
                 raise HTTPException(status_code=400, detail="No fields to update")
@@ -450,12 +592,7 @@ async def update_event(event_id: int, event: EventUpdate):
             cursor.execute("SELECT * FROM events WHERE id = ?", (event_id,))
             row = cursor.fetchone()
             
-            # Helper function to safely get column values
-            def safe_get(row, column, default=None):
-                try:
-                    return row[column] if row[column] is not None else default
-                except (KeyError, IndexError):
-                    return default
+            rsvp_counts = get_rsvp_counts(conn, event_id)
             
             return EventResponse(
                 id=row["id"],
@@ -469,6 +606,15 @@ async def update_event(event_id: int, event: EventUpdate):
                 recurrence_interval=safe_get(row, 'recurrence_interval'),
                 recurrence_end_date=safe_get(row, 'recurrence_end_date'),
                 parent_event_id=safe_get(row, 'parent_event_id'),
+                location_type=safe_get(row, 'location_type', 'in_person'),
+                location_name=safe_get(row, 'location_name'),
+                location_address=safe_get(row, 'location_address'),
+                online_meeting_url=safe_get(row, 'online_meeting_url'),
+                max_attendees=safe_get(row, 'max_attendees'),
+                rsvp_count=sum(rsvp_counts.values()),
+                going_count=rsvp_counts["going"],
+                maybe_count=rsvp_counts["maybe"],
+                not_going_count=rsvp_counts["not_going"],
                 created_at=datetime.fromisoformat(row["created_at"]),
                 updated_at=datetime.fromisoformat(row["updated_at"])
             )
@@ -481,7 +627,7 @@ async def update_event(event_id: int, event: EventUpdate):
 
 @app.delete("/api/events/{event_id}", tags=["Events"])
 async def delete_event(event_id: int):
-    """Delete an event"""
+    """Delete an event and all associated RSVPs"""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
@@ -489,17 +635,213 @@ async def delete_event(event_id: int):
             if not cursor.fetchone():
                 raise HTTPException(status_code=404, detail="Event not found")
             
+            # Delete RSVPs first (due to foreign key constraints)
+            cursor.execute("DELETE FROM rsvps WHERE event_id = ?", (event_id,))
+            
             # Delete the event and any recurring instances
             cursor.execute("DELETE FROM events WHERE id = ? OR parent_event_id = ?", (event_id, event_id))
             conn.commit()
             
-            return {"message": "Event deleted successfully", "event_id": event_id}
+            return {"message": "Event and all RSVPs deleted successfully", "event_id": event_id}
     
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error deleting event: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete event: {str(e)}")
+
+# RSVP Endpoints
+
+@app.post("/api/events/{event_id}/rsvp", response_model=RSVPResponse, tags=["RSVPs"])
+async def create_rsvp(event_id: int, rsvp: RSVPCreate):
+    """Create an RSVP for an event"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if event exists
+            cursor.execute("SELECT * FROM events WHERE id = ?", (event_id,))
+            event_row = cursor.fetchone()
+            if not event_row:
+                raise HTTPException(status_code=404, detail="Event not found")
+            
+            # Check if max attendees limit would be exceeded
+            if event_row["max_attendees"]:
+                cursor.execute("SELECT COUNT(*) FROM rsvps WHERE event_id = ? AND status = 'going'", (event_id,))
+                current_going = cursor.fetchone()[0]
+                if rsvp.status == RSVPStatus.GOING and current_going >= event_row["max_attendees"]:
+                    raise HTTPException(status_code=400, detail="Event is at maximum capacity")
+            
+            # Check if RSVP already exists for this email
+            if rsvp.attendee_email:
+                cursor.execute("SELECT id FROM rsvps WHERE event_id = ? AND attendee_email = ?", 
+                             (event_id, rsvp.attendee_email))
+                existing = cursor.fetchone()
+                if existing:
+                    raise HTTPException(status_code=400, detail="RSVP already exists for this email")
+            
+            cursor.execute("""
+                INSERT INTO rsvps (event_id, attendee_name, attendee_email, status, notes)
+                VALUES (?, ?, ?, ?, ?)
+            """, (event_id, rsvp.attendee_name, rsvp.attendee_email, rsvp.status, rsvp.notes))
+            
+            rsvp_id = cursor.lastrowid
+            conn.commit()
+            
+            # Fetch the created RSVP
+            cursor.execute("SELECT * FROM rsvps WHERE id = ?", (rsvp_id,))
+            row = cursor.fetchone()
+            
+            return RSVPResponse(
+                id=row["id"],
+                event_id=row["event_id"],
+                attendee_name=row["attendee_name"],
+                attendee_email=row["attendee_email"],
+                status=row["status"],
+                notes=row["notes"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"])
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error creating RSVP: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create RSVP: {str(e)}")
+
+@app.get("/api/events/{event_id}/rsvps", response_model=List[RSVPResponse], tags=["RSVPs"])
+async def get_event_rsvps(event_id: int, status: Optional[RSVPStatus] = None):
+    """Get all RSVPs for an event"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if event exists
+            cursor.execute("SELECT id FROM events WHERE id = ?", (event_id,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Event not found")
+            
+            query = "SELECT * FROM rsvps WHERE event_id = ?"
+            params = [event_id]
+            
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+            
+            query += " ORDER BY created_at"
+            
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            
+            rsvps = []
+            for row in rows:
+                rsvps.append(RSVPResponse(
+                    id=row["id"],
+                    event_id=row["event_id"],
+                    attendee_name=row["attendee_name"],
+                    attendee_email=row["attendee_email"],
+                    status=row["status"],
+                    notes=row["notes"],
+                    created_at=datetime.fromisoformat(row["created_at"]),
+                    updated_at=datetime.fromisoformat(row["updated_at"])
+                ))
+            
+            return rsvps
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching RSVPs: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch RSVPs: {str(e)}")
+
+@app.put("/api/events/{event_id}/rsvp/{rsvp_id}", response_model=RSVPResponse, tags=["RSVPs"])
+async def update_rsvp(event_id: int, rsvp_id: int, rsvp_update: RSVPUpdate):
+    """Update an RSVP"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if RSVP exists and belongs to the event
+            cursor.execute("SELECT * FROM rsvps WHERE id = ? AND event_id = ?", (rsvp_id, event_id))
+            existing_rsvp = cursor.fetchone()
+            if not existing_rsvp:
+                raise HTTPException(status_code=404, detail="RSVP not found")
+            
+            # Check capacity constraints if changing to 'going'
+            if rsvp_update.status == RSVPStatus.GOING and existing_rsvp["status"] != "going":
+                cursor.execute("SELECT max_attendees FROM events WHERE id = ?", (event_id,))
+                event_row = cursor.fetchone()
+                if event_row["max_attendees"]:
+                    cursor.execute("SELECT COUNT(*) FROM rsvps WHERE event_id = ? AND status = 'going'", (event_id,))
+                    current_going = cursor.fetchone()[0]
+                    if current_going >= event_row["max_attendees"]:
+                        raise HTTPException(status_code=400, detail="Event is at maximum capacity")
+            
+            # Build update query
+            update_fields = []
+            params = []
+            
+            if rsvp_update.status is not None:
+                update_fields.append("status = ?")
+                params.append(rsvp_update.status)
+            
+            if rsvp_update.notes is not None:
+                update_fields.append("notes = ?")
+                params.append(rsvp_update.notes)
+            
+            if not update_fields:
+                raise HTTPException(status_code=400, detail="No fields to update")
+            
+            update_fields.append("updated_at = CURRENT_TIMESTAMP")
+            params.extend([rsvp_id, event_id])
+            
+            query = f"UPDATE rsvps SET {', '.join(update_fields)} WHERE id = ? AND event_id = ?"
+            cursor.execute(query, params)
+            conn.commit()
+            
+            # Fetch updated RSVP
+            cursor.execute("SELECT * FROM rsvps WHERE id = ?", (rsvp_id,))
+            row = cursor.fetchone()
+            
+            return RSVPResponse(
+                id=row["id"],
+                event_id=row["event_id"],
+                attendee_name=row["attendee_name"],
+                attendee_email=row["attendee_email"],
+                status=row["status"],
+                notes=row["notes"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"])
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating RSVP: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update RSVP: {str(e)}")
+
+@app.delete("/api/events/{event_id}/rsvp/{rsvp_id}", tags=["RSVPs"])
+async def delete_rsvp(event_id: int, rsvp_id: int):
+    """Delete an RSVP"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if RSVP exists and belongs to the event
+            cursor.execute("SELECT * FROM rsvps WHERE id = ? AND event_id = ?", (rsvp_id, event_id))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="RSVP not found")
+            
+            cursor.execute("DELETE FROM rsvps WHERE id = ? AND event_id = ?", (rsvp_id, event_id))
+            conn.commit()
+            
+            return {"message": "RSVP deleted successfully", "rsvp_id": rsvp_id}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting RSVP: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete RSVP: {str(e)}")
 
 @app.get("/api/events/date/{event_date}", response_model=List[EventResponse], tags=["Events"])
 async def get_events_by_date(event_date: date):
@@ -515,15 +857,10 @@ async def get_events_by_date(event_date: date):
             
             rows = cursor.fetchall()
             
-            # Helper function to safely get column values
-            def safe_get(row, column, default=None):
-                try:
-                    return row[column] if row[column] is not None else default
-                except (KeyError, IndexError):
-                    return default
-            
             events = []
             for row in rows:
+                rsvp_counts = get_rsvp_counts(conn, row["id"])
+                
                 events.append(EventResponse(
                     id=row["id"],
                     title=row["title"],
@@ -536,6 +873,15 @@ async def get_events_by_date(event_date: date):
                     recurrence_interval=safe_get(row, 'recurrence_interval'),
                     recurrence_end_date=safe_get(row, 'recurrence_end_date'),
                     parent_event_id=safe_get(row, 'parent_event_id'),
+                    location_type=safe_get(row, 'location_type', 'in_person'),
+                    location_name=safe_get(row, 'location_name'),
+                    location_address=safe_get(row, 'location_address'),
+                    online_meeting_url=safe_get(row, 'online_meeting_url'),
+                    max_attendees=safe_get(row, 'max_attendees'),
+                    rsvp_count=sum(rsvp_counts.values()),
+                    going_count=rsvp_counts["going"],
+                    maybe_count=rsvp_counts["maybe"],
+                    not_going_count=rsvp_counts["not_going"],
                     created_at=datetime.fromisoformat(row["created_at"]),
                     updated_at=datetime.fromisoformat(row["updated_at"])
                 ))
@@ -549,7 +895,7 @@ async def get_events_by_date(event_date: date):
 # Statistics endpoint
 @app.get("/api/stats", tags=["Statistics"])
 async def get_stats():
-    """Get calendar statistics"""
+    """Get calendar statistics including RSVP data"""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
@@ -557,6 +903,14 @@ async def get_stats():
             # Total events
             cursor.execute("SELECT COUNT(*) FROM events")
             total_events = cursor.fetchone()[0]
+            
+            # Total RSVPs
+            cursor.execute("SELECT COUNT(*) FROM rsvps")
+            total_rsvps = cursor.fetchone()[0]
+            
+            # RSVP breakdown
+            cursor.execute("SELECT status, COUNT(*) FROM rsvps GROUP BY status")
+            rsvp_breakdown = {row[0]: row[1] for row in cursor.fetchall()}
             
             # Events this month
             current_date = datetime.now().date()
@@ -576,10 +930,17 @@ async def get_stats():
                           (current_date, future_date))
             upcoming_events = cursor.fetchone()[0]
             
+            # Events by location type
+            cursor.execute("SELECT location_type, COUNT(*) FROM events GROUP BY location_type")
+            events_by_location = {row[0] or 'in_person': row[1] for row in cursor.fetchall()}
+            
             return {
                 "total_events": total_events,
+                "total_rsvps": total_rsvps,
+                "rsvp_breakdown": rsvp_breakdown,
                 "events_this_month": events_this_month,
                 "upcoming_events": upcoming_events,
+                "events_by_location_type": events_by_location,
                 "generated_at": datetime.now()
             }
     
@@ -603,6 +964,7 @@ async def debug_create_event(request: dict):
 
 @app.get("/api/calendar/export.ics", tags=["Export"])
 async def export_calendar():
+    """Export calendar to ICS format"""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
@@ -612,16 +974,15 @@ async def export_calendar():
             if not rows:
                 raise HTTPException(status_code=404, detail="No events found to export")
             
-            ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPROID:-CommunityCalendar//EN\n"
+            ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Community Calendar//EN\n"
 
             for row in rows:
-
                 event_date = datetime.fromisoformat(row["date"])
                 if row["time"]:
                     hours, minutes = map(int, row["time"].split(":"))
                     event_start = event_date.replace(hour=hours, minute=minutes)
                 else:
-                    event_start =  event_date.replace(hour=0, minute=0)
+                    event_start = event_date.replace(hour=0, minute=0)
 
                 event_end = event_start + timedelta(hours=1)
 
@@ -635,28 +996,49 @@ async def export_calendar():
                 ics += f"DTSTART:{dtstart}\n"
                 ics += f"DTEND:{dtend}\n"
                 ics += f"SUMMARY:{row['title']}\n"
+                
                 if row["description"]:
                     ics += f"DESCRIPTION:{row['description']}\n"
                 if row["organizer"]:
                     ics += f"ORGANIZER:{row['organizer']}\n"
+                
+                # Add location information
+                location_type = safe_get(row, 'location_type', 'in_person')
+                location_parts = []
+                
+                if location_type == 'online' and safe_get(row, 'online_meeting_url'):
+                    location_parts.append(f"Online: {row['online_meeting_url']}")
+                elif location_type in ['in_person', 'hybrid']:
+                    if safe_get(row, 'location_name'):
+                        location_parts.append(row['location_name'])
+                    if safe_get(row, 'location_address'):
+                        location_parts.append(row['location_address'])
+                    if location_type == 'hybrid' and safe_get(row, 'online_meeting_url'):
+                        location_parts.append(f"Online option: {row['online_meeting_url']}")
+                
+                if location_parts:
+                    ics += f"LOCATION:{', '.join(location_parts)}\n"
 
                 # Handle recurrence if enabled
-                if row["is_recurring"] and row["recurrence_type"]:
+                if safe_get(row, 'is_recurring') and safe_get(row, 'recurrence_type'):
                     freq = row["recurrence_type"].upper()
-                    interval = row["recurrence_interval"] or 1
+                    interval = safe_get(row, 'recurrence_interval', 1)
                     rrule = f"FREQ={freq};INTERVAL={interval}"
 
-                    if row["recurrence_end_date"]:
+                    if safe_get(row, 'recurrence_end_date'):
                         until = datetime.fromisoformat(row["recurrence_end_date"]).strftime("%Y%m%dT%H%M%SZ")
                         rrule += f";UNTIL={until}"
 
                     ics += f"RRULE:{rrule}\n"
-                ics += f"END:VEVENT\n"
+                
+                ics += "END:VEVENT\n"
+            
             ics += "END:VCALENDAR"
+            
             return Response(
                 content=ics,
                 media_type="text/calendar",
-                headers={"Content-Disposition": "attachment; filename=calendar.ics"}
+                headers={"Content-Disposition": "attachment; filename=community_calendar.ics"}
             )
     except HTTPException:
         raise
