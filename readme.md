@@ -29,21 +29,19 @@ You can try the application here:
 ## Tech Stack
 - **Frontend**: React, Vite, Tailwind, Lucide icons
 - **Backend**: FastAPI(Python), SQLite
-- **Deployment**: Render
+- **Deployment**: Render (Frontend, Backend)
 
 ---
 
 ## Project Overview
 Community Calendar was built to provide a simple alternative to overly complex calendar applications.
-Its focus is on accessibilty, spee, and openness -- allowing communities, teams, and individuals to wuicky share events without unnecessary friction.
+Its focus is on accessibilty, spee, and openness -- allowing communities, teams, and individuals to quickly share events without unnecessary friction.
 
 ---
 
 ## Roadmap
 
 - 🚧 Add user accounts and authentication
-- 🚧 Advaned event filtering and search
-- 🚧 Event statistics and analytics
 - 🚧 Integration with Maps
 
 ---
